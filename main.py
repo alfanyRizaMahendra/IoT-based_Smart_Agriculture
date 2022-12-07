@@ -4,9 +4,15 @@ import time
 from time import sleep
 from datetime import datetime
 import os
-from Adafruit_IO import Client, Feed
 import numpy as np
 import pandas as pd
+import math
+import threading
+from openpyxl import Workbook
+from openpyxl import load_workbook
+
+# MQTT
+from Adafruit_IO import Client, Feed
 
 # for scheduling
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -22,6 +28,11 @@ from tkinter import *
 from tkinter import ttk
 import tkinter.font as tkFont
 from tkinter import messagebox
+from PIL import Image, ImageTk
+
+# Change scheduler interval here !!!!
+request_interval = 70
+subscribe_interval = 6
 
 # -------------------- MQTT adafruit IO --------------------
 mqtt_Username = "ichsan27"
@@ -171,13 +182,13 @@ convert_res = {
 
 res_to_out = {
     0 : "-ON$\n",
-    1 : "!ON$\n",
-    2 : "@ON$\n",
-    3 : "#ON$\n",
-    4 : "%ON$\n",
-    5 : "^ON$\n",
-    6 : "&ON$\n",
-    7 : "*ON$\n", 
+    1 : "qON$\n",
+    2 : "wON$\n",
+    3 : "eON$\n",
+    4 : "rON$\n",
+    5 : "tON$\n",
+    6 : "yON$\n",
+    7 : "uON$\n", 
 }
 
 def bytes_to_int(data):
@@ -189,6 +200,18 @@ def bytes_to_int(data):
         convert = int(convert, 16)
     return convert
 
+def analog_to_lux(intensity):
+    REF_RESISTANCE = 5000 # 5k ohm
+    LUX_CALC_SCALAR = 12518931
+    LUX_CALC_EXPONENT = -1.405
+    
+    raw = intensity * 4 # return 8 bit value to 10 bit value
+    resistorVoltage = raw / 1023 * 5
+    ldrVoltage = 5 - resistorVoltage
+    ldrResistance = ldrVoltage/resistorVoltage * REF_RESISTANCE
+    ldrLux = LUX_CALC_SCALAR * math.pow(ldrResistance, LUX_CALC_EXPONENT)
+    return int(ldrLux)
+
 # -------------------------- Machine learning Model Classification ----------------------
 def classified(X):
     result = []
@@ -198,33 +221,82 @@ def classified(X):
     result.append(load_knn.predict(X)[0])
     return result
 
-recheck = False
-count_classification = 0 # classification flag
-
+# ----------------------------- Excel Database Update ------------------------------------
+def update_db(data, res):
+    year_now = str(datetime.now().year)
+    month_now = str(datetime.now().month)
+    day_now = str(datetime.now().day)
+    path = "logger/"
+    date_now = day_now + "-" + month_now + "-" + year_now
+    file_name = "logger/" + date_now + '_logger.xlsx'
+    if os.path.exists(file_name):
+        wb = load_workbook(filename=file_name)
+        sheet = wb.active
+    else:
+        wb = Workbook()
+        sheet = wb.active
+    sheet['A1'] = "Datetime"
+    sheet['B1'] = "Intensitas Cahaya"
+    sheet['C1'] = "Kelembaban"
+    sheet['D1'] = "temperature"
+    sheet['E1'] = "Hasil Klasifikasi Random Forest"
+    sheet['F1'] = "Hasil Klasifikasi KNN"
+    max = sheet.max_row
+    
+    # Data prepared before update
+    date_update = str(datetime.now())[:19]
+    rows = [data[0], data[1], data[2], res[0], res[1]]
+    
+    # update data
+    sheet.cell(row= 1 + max, column=1).value = date_update
+    for c, value in enumerate(rows, start=1):
+        sheet.cell(row= 1 + max, column=c+1).value = value
+    
+    #save the file
+    wb.save(filename=file_name)
+    wb.close()
+    
 # ----------------------------- IoT and microcontroller communication ------------------------------------
+isDifferent = False
+count_classification = 0 # classification flag
+received_flag = False
+data = [0,0,0]
+result = [0,0]
+
+def request():
+    global stopEvent
+    stopEvent = threading.Event()
+    thread = threading.Thread(target = get_data)
+    thread.start() # start multithread process
+    
 def get_data():
-    global recheck, count_classification
-    ser.flushInput()
+    global recheck, count_classification, data, result, isDifferent, recheck
+    start = time.perf_counter() # start timer
     var = "?luxData$\n"
     ser.write(var.encode())
     rx_data = ser.read_until('\n')
     lux_value = bytes_to_int(rx_data)
-    time.sleep(1)
+    lux_value = analog_to_lux(lux_value)
+    time.sleep(0.5)
     
     var = "?humData$\n"
     ser.write(var.encode())
     rx_data = ser.read_until('\n')
     humidity_value = bytes_to_int(rx_data)
-    time.sleep(1)
+    time.sleep(0.5)
     
     var = "?temData$\n"
     ser.write(var.encode())
     rx_data = ser.read_until('\n')
     tempC_value = bytes_to_int(rx_data)
-    time.sleep(1)
+    time.sleep(0.5)
     
     print("\nlux = " + str(lux_value) + "\nhumidity = " + str(humidity_value) + "\nwater_temp = " + str(tempC_value))
+    stop = time.perf_counter() # stop timer
+    print("\n\n-------------- Total get sensor data via serial time : " + str(round(stop-start, 2)) + " seconds-------\n")
+    
     x = np.array([[lux_value, humidity_value, tempC_value]])
+    data = [lux_value, humidity_value, tempC_value]
     input_x = pd.DataFrame(x, columns = ['Suhu(*C)', 'Kelembaban_Udara(%)', 'Intensitas_Cahaya(Lux)'])
     
     # classification section
@@ -234,27 +306,21 @@ def get_data():
     print(convert_res[result[0]][0])
     print(convert_res[result[0]][1])
     
-    # Rescheduling to make the ideal result, exept for light intensity
-    # for the second checked
-    if result[0] != 0:
-        if result[0] == 3:
-            count_classification += 1
-            if count_classification > 1:
-                recheck = False
-                count_classification = 0
-            else:
-                recheck = True
-        else:
-            recheck = True
-    else:
-        recheck = False
-    
+    start = time.perf_counter() # start timer
     #publishing knn result to web
     publish(x, result[0])
+    stop = time.perf_counter() # stop timer
+    print("\n\n-------------- Total publish sensor data and classification via MQTT time : " + str(round(stop-start, 2)) + " seconds-------\n")
+    
+    #update data to db
+    update_db(x[0], result) 
     
     #Send knn classification result for output driving purposed
     result_send = res_to_out[result[0]]
     ser.write(result_send.encode())
+    ser.flushInput()
+    
+    stopEvent.set() # end multithread process
 
 def publish(data, res):
     condition_value = convert_res[res][0]
@@ -276,19 +342,22 @@ different_pumpState = False
 
 def subscribe():
     global previous_onDuration, previous_offDuration, previous_lampState, previous_pumpState, different_lampState, different_pumpState, different_duration
+    start = time.perf_counter() # start timer
     lampfeed = aio.receive(lamp_state).value
     pumpfeed = aio.receive(pump_state).value
     onDuration = aio.receive(pump_onDuration).value
     offDuration = aio.receive(pump_offDuration).value
     print("lamp feed = {0}\npump feed = {1}\nonDuration_feed = {2}\noffDuration_feed = {3}".format(lampfeed, pumpfeed, onDuration, offDuration))
+    stop = time.perf_counter() # stop timer
+    print("\n\n-------------- Total getting IO control value from web via MQTT time : " + str(round(stop-start, 2) + subscribe_interval) + " seconds-------\n")
     if lampfeed == '1':
-        lamp_state_send = "#ON$\n"
+        lamp_state_send = "dON$\n"
     if lampfeed == '0':
-        lamp_state_send = "#OFF$\n"
+        lamp_state_send = "dOFF$\n"
     if pumpfeed == '1':
-        pump_state_send = "+ON$\n"
+        pump_state_send = "oON$\n"
     if pumpfeed == '0':
-        pump_state_send = "+OFF$\n"
+        pump_state_send = "oOFF$\n"
     
     # preventing repetition
     if onDuration != previous_onDuration:
@@ -306,14 +375,17 @@ def subscribe():
     
     # gate 
     if different_duration == True:
-        duration_update = "~," + str(onDuration) + "," + str(offDuration) + "$\n"
+        duration_update = "p," + str(onDuration) + "," + str(offDuration) + "$\n"
         ser.write(duration_update.encode())
+        ser.flushInput()
         different_duration = False
     if different_lampState == True:
         ser.write(lamp_state_send.encode())
+        ser.flushInput()
         different_lampState = False
     if different_pumpState == True:
         ser.write(pump_state_send.encode())
+        ser.flushInput()
         different_pumpState = False
 
 # ------------------------------------------------------------------------------------------
@@ -324,12 +396,7 @@ BlackSolid  = "#000000"
 font        = "Constantia"
 fontButtons = (font, 12)
 maxWidth    = 640
-maxHeight   = 480
-colorChoice = {'putih' : '$255,255,255$\n',
-               'kuning' : '$255,255,0$\n',
-               'hijau' : '$0,255,0$\n',
-               'biru' : '$0,255,255$\n',
-               'merah' : '$255,0,0$\n'}
+maxHeight   = 480 
 
 def _from_rgb(rgb):
     """translate an rgb tuple to hex"""
@@ -433,6 +500,25 @@ class buttonImg:
         else:
             self.changeOnHover(self.Button_, self.hoverColor, self.hoverColor)
 
+class logo:
+    def __init__(self, obj, imgDir, size, position, bg, command=None):
+        self.obj = obj
+        self.imgDir = imgDir
+        self.size = size
+        self.position = position
+        self.bg = bg
+        self.command = command
+        self.state = True
+        self.Button_ = None
+        
+    def show(self):
+        self.logo = Button(self.obj, width = self.size[0], height = self.size[1], bg = self.bg, borderwidth = 0)
+        self.logo.place(x = self.position[0], y = self.position[1])
+        self.img = Image.open(self.imgDir)
+        self.img = self.img.resize((self.size[0], self.size[1]),  Image.ANTIALIAS)
+        self.img = ImageTk.PhotoImage(self.img)
+        self.logo.config(image = self.img)
+                           
 class framecontroller(tk.Tk):
     def __init__(self, *args, **kwargs):
         tk.Tk.__init__(self, *args, **kwargs)
@@ -452,108 +538,196 @@ class framecontroller(tk.Tk):
   
         container.grid_rowconfigure(0, weight = 1)
         container.grid_columnconfigure(0, weight = 1)
-  
+        
         frame = StartPage(container, self.mainWindow)
-        frame.grid(row = 0, column = 0, sticky ="nsew")
+        frame.grid(row = 0, column = 0, sticky = 'nsew')
         frame.tkraise()
-    
-    def show_frame(self, cont):
-        frame = self.frames[cont]
-        frame.tkraise()
-
+        
 class StartPage(tk.Frame):
     def __init__(self, parent, controller):
+        self.waterPump_flag = False
+        self.peltier_flag = False
+        self.lamp_flag = False
+        self.humidifier_flag = False
+        self.bg = "#ddd"
+        self.fg = "#000"
+        
         tk.Frame.__init__(self, parent)
+        self.parent = parent
         # backgroud
-        self.configure(bg="#444")
+        self.configure(bg=self.bg)
+        
+        # Logo
+        self.ub = logo(self, 'Picture2.png', [50, 50], [10, 10], bg = self.bg)
+        self.ub.show()
+        
+        self.electro = logo(self, 'Picture1.png', [50, 50], [70, 10], bg = self.bg)
+        self.electro.show()
         
         # contain
         # Showing each sensor value
         fontStyleLabel= tkFont.Font(family="Arial", size=55, weight = "bold")
         
-        self.condLabel = Label(self, text="Tidak Ideal", bg='#444', fg='#fff', font=fontStyleLabel)
+        #self.condLabel = Label(self, text="Tidak Ideal", bg='#444', fg='#fff', font=fontStyleLabel)
+        self.condLabel = Label(self, text="      Ideal", bg=self.bg, fg=self.fg, font=fontStyleLabel)
         self.condLabel.pack()
-        self.condLabel.place(x=120,y=40)
+        self.condLabel.place(x=120,y=46)
         
         fontStyleLabel= tkFont.Font(family="Arial", size=25)
         
-        self.tempLabel = Label(self, text="Temperature", bg='#444', fg='#fff', font=fontStyleLabel)
+        self.tempLabel = Label(self, text="Temperature", bg=self.bg , fg=self.fg, font=fontStyleLabel)
         self.tempLabel.pack()
         self.tempLabel.place(x=20,y=150)
         
         fontStyleLabel= tkFont.Font(family="Arial", size=45)
-        self.tempValue = Label(self, text="0", bg='#444', fg='#fff', font=fontStyleLabel)
+        self.tempValue = Label(self, text="0", bg=self.bg, fg=self.fg, font=fontStyleLabel)
         self.tempValue.pack()
         self.tempValue.place(x=20,y=190)
         
         fontStyleLabel= tkFont.Font(family="Arial", size=25)
-        self.humLabel = Label(self, text="Kelembapan", bg='#444', fg='#fff', font=fontStyleLabel)
+        self.humLabel = Label(self, text="Kelembapan", bg=self.bg, fg=self.fg, font=fontStyleLabel)
         self.humLabel.pack()
         self.humLabel.place(x=400,y=150)
         
         fontStyleLabel= tkFont.Font(family="Arial", size=45)
-        self.humValue = Label(self, text="0", bg='#444', fg='#fff', font=fontStyleLabel)
+        self.humValue = Label(self, text="0", bg=self.bg, fg=self.fg, font=fontStyleLabel)
         self.humValue.pack()
         self.humValue.place(x=400,y=190)
         
         fontStyleLabel= tkFont.Font(family="Arial", size=25)
-        self.lightLabel = Label(self, text="Intensitas Cahaya", bg='#444', fg='#fff', font=fontStyleLabel)
+        self.lightLabel = Label(self, text="Intensitas Cahaya", bg=self.bg, fg=self.fg, font=fontStyleLabel)
         self.lightLabel.pack()
         self.lightLabel.place(x=180,y=275)
         
         fontStyleLabel= tkFont.Font(family="Arial", size=45)
-        self.lightValue = Label(self, text="0", bg='#444', fg='#fff', font=fontStyleLabel)
+        self.lightValue = Label(self, text="0", bg=self.bg, fg=self.fg, font=fontStyleLabel)
         self.lightValue.pack()
         self.lightValue.place(x=180,y=315)
         
         # Showing each unit sensor values
         fontStyleLabel= tkFont.Font(family="Arial", size=45)
-        self.tempUnit = Label(self, text="*C", bg='#444', fg='#fff', font=fontStyleLabel)
+        self.tempUnit = Label(self, text="*C", bg=self.bg, fg=self.fg, font=fontStyleLabel)
         self.tempUnit.pack()
         self.tempUnit.place(x=180,y=190)
         
-        self.humUnit = Label(self, text="%", bg='#444', fg='#fff', font=fontStyleLabel)
+        self.humUnit = Label(self, text="%", bg=self.bg, fg=self.fg, font=fontStyleLabel)
         self.humUnit.pack()
         self.humUnit.place(x=570,y=190)
         
-        self.lightUnit = Label(self, text="Lux", bg='#444', fg='#fff', font=fontStyleLabel)
+        self.lightUnit = Label(self, text="Lux", bg=self.bg, fg=self.fg, font=fontStyleLabel)
         self.lightUnit.pack()
         self.lightUnit.place(x=370,y=315)
         
         # Actuator manually control button 
         fontStyle = tkFont.Font(family= "Arial", size=25,weight="bold")
         
-        self.button = buttonL(self,[8,2],[5,400],"Pompa air",fontStyle,18,[BlackSolid,_from_rgb((244,239,140))],lambda : [])
+        self.button = buttonL(self,[8,2],[5,400],"Pompa air",fontStyle,18,[BlackSolid,_from_rgb((244,239,140))],lambda : [self.waterPump()])
         self.button.buttonShow()
         
-        self.button2 = buttonL(self,[7,2],[185,400],"Lampu",fontStyle,18,[BlackSolid,_from_rgb((255,190,100))],lambda : [])
+        self.button2 = buttonL(self,[7,2],[185,400],"Lampu",fontStyle,18,[BlackSolid,_from_rgb((255,190,100))],lambda : [self.lamp()])
         self.button2.buttonShow()
         
-        self.button3 = buttonL(self,[7,2],[338,400],"Peltier",fontStyle,18,[BlackSolid,_from_rgb((255,190,100))],lambda : [])
+        self.button3 = buttonL(self,[7,2],[338,400],"Peltier",fontStyle,18,[BlackSolid,_from_rgb((255,190,100))],lambda : [self.peltier()])
         self.button3.buttonShow()
         
-        self.button4 = buttonL(self,[7,2],[490,400],"Humidifier",fontStyle,18,[BlackSolid,_from_rgb((255,190,100))],lambda : [])
+        self.button4 = buttonL(self,[7,2],[490,400],"Humidifier",fontStyle,18,[BlackSolid,_from_rgb((255,190,100))],lambda : [self.humidifier()])
         self.button4.buttonShow()
         
-    def waterPump(self):
+        # GUI auto update
+        self.parent.after(2000, self.update_gui)
 
+    def update_gui(self):
+        self.lightValue.configure(text=str(data[0]))
+        self.humValue.configure(text=str(data[1]))
+        self.tempValue.configure(text=str(data[2]))
+        if(result[0] == 1):
+            self.condLabel.configure(text = "      Ideal")
+        else:
+            self.condLabel.configure(text = "Tidak Ideal")
+        self.parent.after(2000, self.update_gui)
+        
+    def waterPump(self, event = None):
+        self.waterPump_flag = not(self.waterPump_flag)
+        self.start = time.perf_counter()
+        print(self.waterPump_flag)
+        if(self.waterPump_flag):
+            pump_state_send = "oON$\n"
+            ser.write(pump_state_send.encode())
+            self.stop = time.perf_counter()
+            print("\n\n-------------- Total IO control via serial time : " + str(round(self.stop-self.start, 2)) + " seconds-------\n")
+            messagebox.showinfo("notification", "Pompa Air Menyala !!")
+        else:
+            pump_state_send = "oOFF$\n"
+            ser.write(pump_state_send.encode())
+            self.stop = time.perf_counter()
+            print("\n\n-------------- Total IO control via serial time : " + str(round(self.stop-self.start, 2)) + " seconds-------\n")
+            messagebox.showinfo("notification", "Pompa Air Mati !!")
+    
+    def lamp(self, event = None):
+        self.lamp_flag = not(self.lamp_flag)
+        self.start = time.perf_counter()
+        print(self.lamp_flag)
+        if(self.lamp_flag):
+            lamp_state_send = "dON$\n"
+            ser.write(lamp_state_send.encode())
+            self.stop = time.perf_counter()
+            print("\n\n-------------- Total IO control via serial time : " + str(round(self.stop-self.start, 2)) + " seconds-------\n")
+            messagebox.showinfo("notification", "Lamu UV Menyala !!")
+        else:
+            lamp_state_send = "dOFF$\n"
+            ser.write(lamp_state_send.encode())
+            self.stop = time.perf_counter()
+            print("\n\n-------------- Total IO control via serial time : " + str(round(self.stop-self.start, 2)) + " seconds-------\n")
+            messagebox.showinfo("notification", "Lampu UV Mati !!")
+        
+    def peltier(self, event = None):
+        self.peltier_flag = not(self.peltier_flag)
+        self.start = time.perf_counter()
+        print(self.peltier_flag)
+        if(self.peltier_flag):
+            peltier_state_send = "aON$\n"
+            ser.write(peltier_state_send.encode())
+            self.stop = time.perf_counter()
+            print("\n\n-------------- Total IO control via serial time : " + str(round(self.stop-self.start, 2)) + " seconds-------\n")
+            ser.flushInput()
+            messagebox.showinfo("notification", "Peltier Menyala !!")
+        else:
+            peltier_state_send = "aOFF$\n"
+            ser.write(peltier_state_send.encode())
+            self.stop = time.perf_counter()
+            print("\n\n-------------- Total IO control via serial time : " + str(round(self.stop-self.start, 2)) + " seconds-------\n")
+            ser.flushInput()
+            messagebox.showinfo("notification", "Peltier Mati !!")
+        
+    def humidifier(self, event = None):
+        self.humidifier_flag = not(self.humidifier_flag)
+        self.start = time.perf_counter()
+        print(self.humidifier_flag)
+        if(self.humidifier_flag):
+            humidifier_state_send = "sON$\n"
+            ser.write(humidifier_state_send.encode())
+            self.stop = time.perf_counter()
+            print("\n\n-------------- Total IO control via serial time : " + str(round(self.stop-self.start, 2)) + " seconds-------\n")
+            messagebox.showinfo("notification", "Humidifier Menyala !!")
+        else:
+            humidifier_state_send = "sOFF$\n"
+            ser.write(humidifier_state_send.encode())
+            self.stop = time.perf_counter()
+            print("\n\n-------------- Total IO control via serial time : " + str(round(self.stop-self.start, 2)) + " seconds-------\n")
+            messagebox.showinfo("notification", "Humidifier Mati !!")
+        
 # -------------------------------------- Program Execution ------------------------------
 if __name__ == '__main__':
     app = framecontroller()
     scheduler = BackgroundScheduler()
-    if recheck is False:
-        scheduler.add_job(get_data, 'interval', seconds = 30)
-    else:
-        scheduler.add_job(get_data, 'interval', seconds = 6)
-    scheduler.add_job(subscribe, "interval", seconds = 3)
+    scheduler.add_job(request, 'interval', seconds = request_interval)
+    scheduler.add_job(subscribe, "interval", seconds = subscribe_interval)
     scheduler.start()
-    print('Press Ctrl+{0} to exit'.format('Break' if os.name == 'nt' else 'C'))
-    
+    print('Press Ctrl+{0} to exit'.format('Break' if os.name == 'nt' else 'C'))    
     try:
         # This is here to simulate application activity (which keeps the main thread alive)
         while True:
             app.mainloop()
-            time.sleep(1)
     except:
         # Not strictly necessary if daemonic mode is enabled but should be done if possible
         scheduler.shutdown()
